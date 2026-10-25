@@ -1,7 +1,5 @@
 name: Build APK
 on: workflow_dispatch
-permissions:
-  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -9,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Write project files
         run: |
-          mkdir -p app/src/main/java/com/vidgrab
+          mkdir -p app/src/main/java/com/vidgrab app/src/main/res/mipmap-anydpi app/src/main/res/drawable app/src/main/res/values
           cat > settings.gradle.kts <<'EOF'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
@@ -35,8 +33,8 @@ jobs:
                   applicationId = "com.vidgrab"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
                   ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
               }
               buildFeatures { compose = true }
@@ -53,9 +51,34 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.activity:activity-compose:1.9.0")
               implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+              implementation("io.coil-kt:coil-compose:2.6.0")
               implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
               implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
           }
+          EOF
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#7C5CFF</color>
+          </resources>
+          EOF
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#FFFFFF" android:pathData="M48,30h12v22h10L54,70L38,52h10z" />
+              <path android:fillColor="#FFFFFF" android:pathData="M36,76h36v6H36z" />
+          </vector>
+          EOF
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -63,9 +86,11 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <application
                   android:label="YtVidSave"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
                   android:extractNativeLibs="true"
                   android:usesCleartextTraffic="true"
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -90,14 +115,22 @@ jobs:
           import android.provider.MediaStore
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.compose.foundation.*
           import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.lifecycle.ViewModel
           import androidx.lifecycle.viewModelScope
           import androidx.lifecycle.viewmodel.compose.viewModel
+          import coil.compose.AsyncImage
           import com.yausername.ffmpeg.FFmpeg
           import com.yausername.youtubedl_android.YoutubeDL
           import com.yausername.youtubedl_android.YoutubeDLRequest
@@ -106,10 +139,21 @@ jobs:
           import kotlinx.coroutines.withContext
           import java.io.File
 
+          data class VInfo(val title: String, val thumb: String?, val duration: Int)
+
+          fun extractUrl(t: String): String = Regex("https?://\\S+").find(t)?.value ?: t.trim()
+
+          fun fmt(s: Int): String =
+              if (s >= 3600) "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
+              else "%d:%02d".format(s / 60, s % 60)
+
           class DlViewModel : ViewModel() {
-              var status by mutableStateOf("Link paste karo")
+              var status by mutableStateOf("")
               var progress by mutableStateOf(0f)
               var busy by mutableStateOf(false)
+              var checking by mutableStateOf(false)
+              var info by mutableStateOf<VInfo?>(null)
+              val history = mutableStateListOf<String>()
               private var ready = false
 
               private fun init(ctx: Context) {
@@ -120,30 +164,64 @@ jobs:
                   ready = true
               }
 
-              fun download(ctx: Context, url: String, audioOnly: Boolean) {
+              private fun formatFor(q: String): String {
+                  val h = q.removeSuffix("p").toIntOrNull()
+                      ?: return "bv*+ba/b"
+                  if (h >= 1440) return "bv*[height<=$h]+ba/b[height<=$h]/b"
+                  return "bv*[height<=$h][ext=mp4]+ba[ext=m4a]/b[height<=$h][ext=mp4]/bv*[height<=$h]+ba/b[height<=$h]/b"
+              }
+
+              fun check(ctx: Context, url: String) {
+                  if (checking || busy || url.isBlank()) return
+                  checking = true; info = null; status = "Video ki jankari la raha hu..."
+                  viewModelScope.launch(Dispatchers.IO) {
+                      try {
+                          init(ctx)
+                          val r = YoutubeDLRequest(url.trim()).apply { addOption("--no-playlist") }
+                          val i = YoutubeDL.getInstance().getInfo(r)
+                          val v = VInfo(i.title ?: "Video", i.thumbnail, i.duration.toString().toIntOrNull() ?: 0)
+                          withContext(Dispatchers.Main) { info = v; status = "" }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) { status = "Link check nahi hua: ${e.message?.take(120)}" }
+                      } finally {
+                          withContext(Dispatchers.Main) { checking = false }
+                      }
+                  }
+              }
+
+              fun cancel() {
+                  try { YoutubeDL.getInstance().destroyProcessById("vidgrab") } catch (_: Exception) {}
+              }
+
+              fun download(ctx: Context, url: String, quality: String) {
                   if (busy || url.isBlank()) return
+                  val audio = quality == "MP3"
                   busy = true; progress = 0f; status = "Shuru ho raha hai..."
                   viewModelScope.launch(Dispatchers.IO) {
                       try {
                           init(ctx)
                           val tmp = File(ctx.cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
                           val req = YoutubeDLRequest(url.trim()).apply {
+                              addOption("--no-playlist")
                               addOption("-o", "${tmp.absolutePath}/%(title).80s.%(ext)s")
                               addOption("--no-mtime")
-                              if (audioOnly) {
+                              if (audio) {
                                   addOption("-x"); addOption("--audio-format", "mp3")
                               } else {
-                                  addOption("-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b")
+                                  addOption("-f", formatFor(quality))
                                   addOption("--merge-output-format", "mp4")
                               }
                           }
-                          YoutubeDL.getInstance().execute(req, "vidgrab") { p, _, _ ->
+                          YoutubeDL.getInstance().execute(req, "vidgrab") { p, eta, _ ->
                               progress = (p / 100f).coerceIn(0f, 1f)
-                              status = "Downloading... ${p.toInt()}%"
+                              status = "Downloading... ${p.toInt().coerceAtLeast(0)}%   (${eta}s baaki)"
                           }
                           val out = tmp.listFiles()?.firstOrNull() ?: error("File nahi bani")
-                          saveToDownloads(ctx, out, audioOnly)
-                          withContext(Dispatchers.Main) { status = "Ho gaya! Downloads/VidGrab folder mein: ${out.name}" }
+                          saveToDownloads(ctx, out, audio)
+                          withContext(Dispatchers.Main) {
+                              history.add(0, out.name)
+                              status = "Ho gaya! Download/VidGrab folder mein save hui."
+                          }
                       } catch (e: Exception) {
                           withContext(Dispatchers.Main) { status = "Error: ${e.message?.take(150)}" }
                       } finally {
@@ -169,25 +247,109 @@ jobs:
                   super.onCreate(savedInstanceState)
                   val shared = if (intent?.action == Intent.ACTION_SEND)
                       intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty() else ""
-                  setContent { MaterialTheme { Screen(shared) } }
+                  setContent { AppTheme { Screen(extractUrl(shared)) } }
+              }
+          }
+
+          @Composable
+          fun AppTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Color(0xFF9D86FF), onPrimary = Color(0xFF1A0F4D),
+                      background = Color(0xFF0F0D1A), surface = Color(0xFF1A1730),
+                      onBackground = Color(0xFFEDE9FF), onSurface = Color(0xFFEDE9FF),
+                      surfaceVariant = Color(0xFF2A2547), onSurfaceVariant = Color(0xFFB8B0D9)
+                  )
+              ) {
+                  Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background, content = content)
+              }
+          }
+
+          @Composable
+          fun InfoCard(i: VInfo) {
+              Card(
+                  shape = RoundedCornerShape(20.dp),
+                  colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+              ) {
+                  Column {
+                      if (i.thumb != null) {
+                          AsyncImage(
+                              model = i.thumb, contentDescription = null, contentScale = ContentScale.Crop,
+                              modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+                          )
+                      }
+                      Column(Modifier.padding(14.dp)) {
+                          Text(i.title, style = MaterialTheme.typography.titleMedium, maxLines = 2)
+                          if (i.duration > 0) {
+                              Text("Duration: ${fmt(i.duration)}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                          }
+                      }
+                  }
               }
           }
 
           @Composable
           fun Screen(initial: String, vm: DlViewModel = viewModel()) {
-              val ctx = androidx.compose.ui.platform.LocalContext.current
+              val ctx = LocalContext.current
+              val clip = LocalClipboardManager.current
               var url by remember { mutableStateOf(initial) }
-              var audio by remember { mutableStateOf(false) }
-              Surface(Modifier.fillMaxSize()) {
-                  Column(Modifier.padding(20.dp).statusBarsPadding(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                      Text("YtVidSave", style = MaterialTheme.typography.headlineMedium)
-                      OutlinedTextField(url, { url = it }, label = { Text("Video link") }, modifier = Modifier.fillMaxWidth())
-                      Row { Checkbox(audio, { audio = it }); Text("Sirf audio (MP3)", Modifier.padding(top = 12.dp)) }
-                      Button({ vm.download(ctx, url, audio) }, enabled = !vm.busy, modifier = Modifier.fillMaxWidth()) {
-                          Text(if (vm.busy) "Downloading..." else "Download")
+              var quality by remember { mutableStateOf("Best") }
+              val qualities = listOf("Best", "4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "MP3")
+              Column(
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) {
+                  Text("YtVidSave", style = MaterialTheme.typography.headlineLarge,
+                      color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                  Text("Link paste karo, quality chuno, download karo",
+                      color = MaterialTheme.colorScheme.onSurfaceVariant)
+                  OutlinedTextField(
+                      value = url, onValueChange = { url = it },
+                      label = { Text("Video link") }, singleLine = true,
+                      shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth(),
+                      trailingIcon = {
+                          TextButton(onClick = {
+                              clip.getText()?.text?.let { url = extractUrl(it) }
+                          }) { Text("Paste") }
                       }
-                      if (vm.busy) LinearProgressIndicator(progress = { vm.progress }, modifier = Modifier.fillMaxWidth())
-                      Text(vm.status)
+                  )
+                  OutlinedButton(
+                      onClick = { vm.check(ctx, url) },
+                      enabled = !vm.checking && !vm.busy && url.isNotBlank(),
+                      shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()
+                  ) { Text(if (vm.checking) "Check ho raha hai..." else "Video check karo") }
+                  vm.info?.let { InfoCard(it) }
+                  Text("Quality", style = MaterialTheme.typography.titleMedium)
+                  Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      qualities.forEach { q ->
+                          FilterChip(selected = quality == q, onClick = { quality = q }, label = { Text(q) })
+                      }
+                  }
+                  Text("4320p = 8K, 2160p = 4K, 1440p = 2K (sirf tab jab video mein ho)",
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      style = MaterialTheme.typography.bodySmall)
+                  Button(
+                      onClick = { vm.download(ctx, url, quality) },
+                      enabled = !vm.busy && url.isNotBlank(),
+                      shape = RoundedCornerShape(16.dp),
+                      modifier = Modifier.fillMaxWidth().height(54.dp)
+                  ) { Text(if (vm.busy) "Downloading..." else "Download", fontWeight = FontWeight.Bold) }
+                  if (vm.busy) {
+                      LinearProgressIndicator(progress = { vm.progress }, modifier = Modifier.fillMaxWidth())
+                      TextButton(onClick = { vm.cancel() }) { Text("Cancel") }
+                  }
+                  if (vm.status.isNotBlank()) {
+                      Text(vm.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                  }
+                  if (vm.history.isNotEmpty()) {
+                      Text("Abhi download hue", style = MaterialTheme.typography.titleMedium)
+                      vm.history.forEach { name ->
+                          Card(
+                              shape = RoundedCornerShape(14.dp),
+                              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                              modifier = Modifier.fillMaxWidth()
+                          ) { Text(name, maxLines = 2, modifier = Modifier.padding(12.dp)) }
+                      }
                   }
               }
           }
@@ -205,6 +367,3 @@ jobs:
         with:
           name: YtVidSave-APK
           path: app/build/outputs/apk/debug/app-debug.apk
-      - run: gh release create v${{ github.run_number }} app/build/outputs/apk/debug/app-debug.apk --title "YtVidSave" --notes "apk"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
