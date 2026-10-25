@@ -1,0 +1,206 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/vidgrab
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "YtVidSave"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          printf 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n' > gradle.properties
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.vidgrab"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.vidgrab"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+              implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="YtVidSave"
+                  android:extractNativeLibs="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/vidgrab/MainActivity.kt <<'EOF'
+          package com.vidgrab
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.lifecycle.ViewModel
+          import androidx.lifecycle.viewModelScope
+          import androidx.lifecycle.viewmodel.compose.viewModel
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class DlViewModel : ViewModel() {
+              var status by mutableStateOf("Link paste karo")
+              var progress by mutableStateOf(0f)
+              var busy by mutableStateOf(false)
+              private var ready = false
+
+              private fun init(ctx: Context) {
+                  if (ready) return
+                  YoutubeDL.getInstance().init(ctx)
+                  FFmpeg.getInstance().init(ctx)
+                  try { YoutubeDL.getInstance().updateYoutubeDL(ctx, YoutubeDL.UpdateChannel.STABLE) } catch (_: Exception) {}
+                  ready = true
+              }
+
+              fun download(ctx: Context, url: String, audioOnly: Boolean) {
+                  if (busy || url.isBlank()) return
+                  busy = true; progress = 0f; status = "Shuru ho raha hai..."
+                  viewModelScope.launch(Dispatchers.IO) {
+                      try {
+                          init(ctx)
+                          val tmp = File(ctx.cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
+                          val req = YoutubeDLRequest(url.trim()).apply {
+                              addOption("-o", "${tmp.absolutePath}/%(title).80s.%(ext)s")
+                              addOption("--no-mtime")
+                              if (audioOnly) {
+                                  addOption("-x"); addOption("--audio-format", "mp3")
+                              } else {
+                                  addOption("-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b")
+                                  addOption("--merge-output-format", "mp4")
+                              }
+                          }
+                          YoutubeDL.getInstance().execute(req, "vidgrab") { p, _, _ ->
+                              progress = (p / 100f).coerceIn(0f, 1f)
+                              status = "Downloading... ${p.toInt()}%"
+                          }
+                          val out = tmp.listFiles()?.firstOrNull() ?: error("File nahi bani")
+                          saveToDownloads(ctx, out, audioOnly)
+                          withContext(Dispatchers.Main) { status = "Ho gaya! Downloads/VidGrab folder mein: ${out.name}" }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) { status = "Error: ${e.message?.take(150)}" }
+                      } finally {
+                          withContext(Dispatchers.Main) { busy = false }
+                      }
+                  }
+              }
+
+              private fun saveToDownloads(ctx: Context, f: File, audio: Boolean) {
+                  val values = ContentValues().apply {
+                      put(MediaStore.Downloads.DISPLAY_NAME, f.name)
+                      put(MediaStore.Downloads.MIME_TYPE, if (audio) "audio/mpeg" else "video/mp4")
+                      put(MediaStore.Downloads.RELATIVE_PATH, "Download/VidGrab")
+                      }
+                  val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)!!
+                  ctx.contentResolver.openOutputStream(uri)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+                  f.delete()
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val shared = if (intent?.action == Intent.ACTION_SEND)
+                      intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty() else ""
+                  setContent { MaterialTheme { Screen(shared) } }
+              }
+          }
+
+          @Composable
+          fun Screen(initial: String, vm: DlViewModel = viewModel()) {
+              val ctx = androidx.compose.ui.platform.LocalContext.current
+              var url by remember { mutableStateOf(initial) }
+              var audio by remember { mutableStateOf(false) }
+              Surface(Modifier.fillMaxSize()) {
+                  Column(Modifier.padding(20.dp).statusBarsPadding(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                      Text("YtVidSave", style = MaterialTheme.typography.headlineMedium)
+                      OutlinedTextField(url, { url = it }, label = { Text("Video link") }, modifier = Modifier.fillMaxWidth())
+                      Row { Checkbox(audio, { audio = it }); Text("Sirf audio (MP3)", Modifier.padding(top = 12.dp)) }
+                      Button({ vm.download(ctx, url, audio) }, enabled = !vm.busy, modifier = Modifier.fillMaxWidth()) {
+                          Text(if (vm.busy) "Downloading..." else "Download")
+                      }
+                      if (vm.busy) LinearProgressIndicator(progress = { vm.progress }, modifier = Modifier.fillMaxWidth())
+                      Text(vm.status)
+                  }
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YtVidSave-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+                      
